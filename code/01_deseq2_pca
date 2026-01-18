@@ -1,0 +1,182 @@
+#!/usr/bin/env Rscript
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(dplyr)
+  library(tibble)
+  library(matrixStats)
+  library(factoextra)
+  library(ggplot2)
+  library(haven)
+  library(tidyr)
+})
+
+# ------------------------------
+# 0) Paths
+# ------------------------------
+counts_path <- "data/normalized_genecounts.csv"        # genes x samples (integer counts)
+sav_path    <- "data/data20260106_complete.sav"        # metadata with STUDY_NUMBER + covariates
+out_dir_res <- "results"
+out_dir_fig <- "figures"
+
+dir.create(out_dir_res, showWarnings = FALSE, recursive = TRUE)
+dir.create(out_dir_fig, showWarnings = FALSE, recursive = TRUE)
+
+# ------------------------------
+# 1) Load counts + metadata
+# ------------------------------
+counts <- read.csv(counts_path, row.names = 1, check.names = FALSE)
+counts <- as.matrix(counts)
+
+meta_raw <- haven::read_sav(sav_path) %>% as.data.frame()
+meta_raw$STUDY_NUMBER <- as.character(meta_raw$STUDY_NUMBER)
+
+# Keep only samples present in counts
+sample_ids <- colnames(counts)
+
+meta <- meta_raw %>%
+  filter(STUDY_NUMBER %in% sample_ids) %>%
+  distinct(STUDY_NUMBER, .keep_all = TRUE) %>%
+  column_to_rownames("STUDY_NUMBER")
+
+# Reorder metadata to match counts columns
+meta <- meta[sample_ids, , drop = FALSE]
+
+stopifnot(all(rownames(meta) == colnames(counts)))
+stopifnot("sym_4g" %in% colnames(meta))
+
+meta$sym_4g <- factor(meta$sym_4g)
+
+# Optional: known technical batch (recommended if available)
+has_batch <- "batch" %in% colnames(meta)
+if (has_batch) meta$batch <- factor(meta$batch)
+
+# ------------------------------
+# 2) DESeq2 model
+# ------------------------------
+design_formula <- if (has_batch) ~ batch + sym_4g else ~ sym_4g
+
+dds <- DESeqDataSetFromMatrix(
+  countData = round(counts),
+  colData   = meta,
+  design    = design_formula
+)
+
+dds <- dds[rowSums(counts(dds)) >= 10, ]
+dds <- DESeq(dds)
+
+saveRDS(dds, file.path(out_dir_res, "dds.rds"))
+
+# ------------------------------
+# 3) Differential expression contrasts
+# ------------------------------
+# Check levels if needed:
+# levels(meta$sym_4g)
+
+res_afx_vs_asy <- results(dds, contrast = c("sym_4g", "Amaurosis_fugax", "asymptomatic"))
+res_afx_vs_tia <- results(dds, contrast = c("sym_4g", "Amaurosis_fugax", "TIA"))
+res_afx_vs_str <- results(dds, contrast = c("sym_4g", "Amaurosis_fugax", "stroke"))
+
+write.csv(as.data.frame(res_afx_vs_asy), file.path(out_dir_res, "DE_AFX_vs_Asymptomatic.csv"))
+write.csv(as.data.frame(res_afx_vs_tia), file.path(out_dir_res, "DE_AFX_vs_TIA.csv"))
+write.csv(as.data.frame(res_afx_vs_str), file.path(out_dir_res, "DE_AFX_vs_Stroke.csv"))
+
+# ------------------------------
+# 4) VST for PCA
+# ------------------------------
+vsd <- vst(dds, blind = FALSE)
+vsd_mat <- assay(vsd)
+
+# ------------------------------
+# 5) PCA gene selection: top 500 per comparison (rank by FDR)
+# ------------------------------
+get_top_by_fdr <- function(res, n = 500, lfc_cut = 0.2, fdr_cut = 0.1) {
+  as.data.frame(res) %>%
+    rownames_to_column("gene") %>%
+    filter(!is.na(padj), !is.na(log2FoldChange)) %>%
+    filter(padj < fdr_cut, abs(log2FoldChange) > lfc_cut) %>%
+    arrange(padj) %>%
+    slice_head(n = n) %>%
+    pull(gene)
+}
+
+res_list <- list(
+  AFX_vs_Asymptomatic = res_afx_vs_asy,
+  AFX_vs_TIA          = res_afx_vs_tia,
+  AFX_vs_Stroke       = res_afx_vs_str
+)
+
+top_lists <- lapply(res_list, get_top_by_fdr, n = 500, lfc_cut = 0.2, fdr_cut = 0.1)
+selected_genes <- unique(unlist(top_lists))
+selected_genes <- intersect(selected_genes, rownames(vsd_mat))
+
+write.csv(data.frame(gene = selected_genes),
+          file.path(out_dir_res, "PCA_selected_genes_top500_per_comparison.csv"),
+          row.names = FALSE)
+
+# ------------------------------
+# 6) PCA (A) selected genes
+# ------------------------------
+mat_sel <- t(vsd_mat[selected_genes, , drop = FALSE])
+pca_sel <- prcomp(mat_sel, center = TRUE, scale. = FALSE)
+var_sel <- 100 * (pca_sel$sdev^2 / sum(pca_sel$sdev^2))
+
+p_sel <- fviz_pca_ind(
+  pca_sel,
+  geom.ind = "point",
+  pointshape = 20,
+  pointsize = 1.8,
+  col.ind = meta$sym_4g,
+  palette = c("#E41A1C", "green4", "purple2", "#377EB8"),
+  mean.point = TRUE,
+  mean.point.size = 4,
+  repel = TRUE,
+  legend.title = "Clinical manifestation"
+) +
+  labs(
+    title = "PCA (top 500 DE genes per comparison; duplicates removed)",
+    x = sprintf("PC1 (%.1f%%)", var_sel[1]),
+    y = sprintf("PC2 (%.1f%%)", var_sel[2])
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "top")
+
+ggsave(file.path(out_dir_fig, "PCA_top500DEGs.pdf"), p_sel, width = 7, height = 6)
+
+# ------------------------------
+# 7) PCA (B) unbiased: all expressed genes
+# ------------------------------
+mat_all <- t(vsd_mat)
+pca_all <- prcomp(mat_all, center = TRUE, scale. = FALSE)
+var_all <- 100 * (pca_all$sdev^2 / sum(pca_all$sdev^2))
+
+p_all <- fviz_pca_ind(
+  pca_all,
+  geom.ind = "point",
+  pointshape = 20,
+  pointsize = 1.8,
+  col.ind = meta$sym_4g,
+  palette = c("#E41A1C", "green4", "purple2", "#377EB8"),
+  mean.point = TRUE,
+  mean.point.size = 4,
+  repel = TRUE,
+  legend.title = "Clinical manifestation"
+) +
+  labs(
+    title = "PCA (all expressed genes)",
+    x = sprintf("PC1 (%.1f%%)", var_all[1]),
+    y = sprintf("PC2 (%.1f%%)", var_all[2])
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "top")
+
+ggsave(file.path(out_dir_fig, "PCA_allGenes.pdf"), p_all, width = 7, height = 6)
+
+# ------------------------------
+# 8) Session info for reproducibility
+# ------------------------------
+sink(file.path(out_dir_res, "sessionInfo.txt"))
+print(sessionInfo())
+sink()
